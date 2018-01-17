@@ -1,83 +1,155 @@
-"""
-    py2c
-    ~~~~
+r"""
+py2c
+~~~~
 
-    Convert simple numeric python code into C code.
+Convert simple numeric python code into C code.
 
-    The translate() function works on
+This code is intended to translate direct algorithms for scientific code
+(mostly if statements and for loops operating on double precision values)
+into C code. Unlike projects like numba, cython, pypy and nuitka, the
+:func:`translate` function returns the corresponding C which can then be
+compiled with tinycc or sent to the GPU using CUDA or OpenCL.
 
-    Variables definition in C
-    -------------------------
-    Defining variables within the translate function is a bit of a guess work,
-    using following rules:
-    *   By default, a variable is a 'double'.
-    *   Variable in a for loop is an int.
-    *   Variable that is references with brackets is an array of doubles. The
-        variable within the brackets is integer. For example, in the
-        reference 'var1[var2]', var1 is a double array, and var2 is an integer.
-    *   Assignment to an argument makes that argument an array, and the index
-        in that assignment is 0.
-        For example, the following python code::
-            def func(arg1, arg2):
-                arg2 = 17.
-        is translated to the following C code::
-            double func(double arg1)
-            {
-                arg2[0] = 17.0;
-            }
-        For example, the following python code is translated to the
-        following C code::
+There is special handling certain constructs, such as *for i in range* and
+small integer powers.
 
-            def func(arg1, arg2):          double func(double arg1) {
-                arg2 = 17.                      arg2[0] = 17.0;
-                                            }
-    *   All functions are defined as double, even if there is no
-        return statement.
+**TODO: make a nice list of supported constructs***
 
-Based on codegen.py:
+Imports are not supported, but they are at least ignored so that properly
+constructed code can be run via python or translated to C without change.
 
+Most other python constructs are **not** supported:
+* classes
+* builtin types (dict, set, list)
+* exceptions
+* with context
+* del
+* yield
+* async
+* list slicing
+* multiple return values
+* "is/is not", "in/not in" conditionals
+
+There is limited support for list and list comprehensions, so long as they
+can be represented by a fixed array whose size is known at compile time, and
+they are small enough to be stored on the stack.
+
+Variables definition in C
+-------------------------
+Defining variables within the translate function is a bit of a guess work,
+using following rules:
+*   By default, a variable is a 'double'.
+*   Variable in a for loop is an int.
+*   Variable that is references with brackets is an array of doubles. The
+    variable within the brackets is integer. For example, in the
+    reference 'var1[var2]', var1 is a double array, and var2 is an integer.
+*   Assignment to an argument makes that argument an array, and the index
+    in that assignment is 0.
+    For example, the following python code::
+        def func(arg1, arg2):
+            arg2 = 17.
+    is translated to the following C code::
+        double func(double arg1)
+        {
+            arg2[0] = 17.0;
+        }
+    For example, the following python code is translated to the
+    following C code::
+
+        def func(arg1, arg2):          double func(double arg1) {
+            arg2 = 17.                      arg2[0] = 17.0;
+                                        }
+*   All functions are defined as double, even if there is no
+    return statement.
+
+Debugging
+---------
+
+*print* is partially supported using a simple regular expression. This
+requires a stylized form. Be sure to use print as a function instead of
+the print statement. If you are including substition variables, use the
+% string substitution style. Include parentheses around the substitution
+tuple, even if there is only one item; do not include the final comma even
+if it is a single item (yes, it won't be a tuple, but it makes the regexp
+much simpler). Keep the item on a single line. Here are three forms that work::
+
+    print("x") => printf("x\n");
+    print("x %g"%(a)) => printf("x %g\n", a);
+    print("x %g %g %g"%(a, b, c)) => printf("x %g %g %g\n", a, b, c);
+
+You can generate *main* using the *if __name__ == "__main__":* construct.
+This does a simple substitution with "def main():" before translation and
+a substitution with "int main(int argc, double *argv[])" after translation.
+The result is that the content of the *if* block becomes the content of *main*.
+Along with the print statement, you can run and test a translation standalone
+using::
+
+    python py2c.py source.py
+    cc source.c
+    ./a.out
+
+Known issues
+------------
+The following constructs may cause problems:
+
+* implicit arrays: possible namespace collision for variable "vec#"
+* swap fails: "x,y = y,x" will set x==y
+* top-level statements: code outside a function body causes errors
+* line number skew: each statement should be tagged with its own #line
+  to avoid skew as comments are skipped and loop bodies are wrapped with
+  braces, etc.
+
+References
+----------
+
+Based on a variant of codegen.py:
+
+    https://github.com/andreif/codegen
     :copyright: Copyright 2008 by Armin Ronacher.
     :license: BSD.
 """
-"""
-Update Notes
-============
-11/22/2017, O.E.   Each 'visit_*' method is to build a C statement string. It
-                    shold insert 4 blanks per indentation level.
-                    The 'body' method will combine all the strings, by adding
-                    the 'current_statement' to the c_proc string list
-   11/2017, OE: variables, argument definition implemented.
-   Note: An argument is considered an array if it is the target of an
-        assignment. In that case it is translated to <var>[0]
-11/27/2017, OE: 'pow' basicly working
-  /12/2017, OE: Multiple assignment: a1,a2,...,an=b1,b2,...bn implemented
-  /12/2017, OE: Power function, including special cases of
-                square(x)(pow(x,2)) and cube(x)(pow(x,3)), implemented in
-                translate_power, called from visit_BinOp
-12/07/2017, OE: Translation of integer division, '\\' in python, implemented
-                in translate_integer_divide, called from visit_BinOp
-12/07/2017, OE: C variable definition handled in 'define_c_vars'
-              : Python integer division, '//', translated to C in
-                'translate_integer_divide'
-12/15/2017, OE: Precedence maintained by writing opening and closing
-                parenthesesm '(',')', in procedure 'visit_BinOp'.
-12/18/2017, OE: Added call to 'add_current_line()' at the beginning
-                of visit_Return
-01/4/2018, O.E. Added functions 'get_files_names()', , 'print_usage()'. The get_files_names()
-                function retrieves the in/out file names form the command line, and returns
-                true/false if the number of parameters is valid. In case of no input
-                parameters, usage is prompt and the program terminates.
-01/4/2018, O.E. 'translate(functions, constants=None)' returns string, instaed of a list
-01/04/2017 O.E. Fixed bug in 'visit_If': visiting node.orelse in case else exists.
-01/05/2018 O.E. New class C_Vector defined. It holds name, type, size and initial values.
-                Assignment to that class in 'sequence_visit'.
-                Reading and inserting declaration in 'insert_c_vars'
 
+# Update Notes
+# ============
+# 2017-11-22, OE: Each 'visit_*' method is to build a C statement string. It
+#                 shold insert 4 blanks per indentation level. The 'body'
+#                 method will combine all the strings, by adding the
+#                 'current_statement' to the c_proc string list
+# 2017-11-22, OE: variables, argument definition implemented.  Note: An
+#                 argument is considered an array if it is the target of an
+#                 assignment. In that case it is translated to <var>[0]
+# 2017-11-27, OE: 'pow' basicly working
+# 2017-12-07, OE: Multiple assignment: a1,a2,...,an=b1,b2,...bn implemented
+# 2017-12-07, OE: Power function, including special cases of
+#                 square(x)(pow(x,2)) and cube(x)(pow(x,3)), implemented in
+#                 translate_power, called from visit_BinOp
+# 2017-12-07, OE: Translation of integer division, '\\' in python, implemented
+#                 in translate_integer_divide, called from visit_BinOp
+# 2017-12-07, OE: C variable definition handled in 'define_c_vars'
+#               : Python integer division, '//', translated to C in
+#                 'translate_integer_divide'
+# 2017-12-15, OE: Precedence maintained by writing opening and closing
+#                 parenthesesm '(',')', in procedure 'visit_BinOp'.
+# 2017-12-18, OE: Added call to 'add_current_line()' at the beginning
+#                 of visit_Return
+# 2018-01-03, PK: Update interface for use in sasmodels
+# 2018-01-03, PK: support "expr if cond else expr" syntax
+# 2018-01-03, PK: x//y => (int)((x)/(y)) and x/y => ((double)(x)/(double)(y))
+# 2018-01-03, PK: True/False => true/false
+# 2018-01-03, PK: f(x) was introducing an extra semicolon
+# 2018-01-03, PK: simplistic print function, for debugging
+# 2018-01-03, PK: while expr: ... => while (expr) { ... }
+# 2018-01-04, OE: Fixed bug in 'visit_If': visiting node.orelse in case else exists.
 
-"""
-import ast
+from __future__ import print_function
+
 import sys
+import ast
 from ast import NodeVisitor
+try: # for debugging, astor lets us print out the node as python
+    import astor
+except ImportError:
+    pass
 
 BINOP_SYMBOLS = {}
 BINOP_SYMBOLS[ast.Add] = '+'
@@ -116,16 +188,7 @@ UNARYOP_SYMBOLS[ast.UAdd] = '+'
 UNARYOP_SYMBOLS[ast.USub] = '-'
 
 
-def to_source(tree, constants=None, fname=None, lineno=0):
-    """
-    This function can convert a syntax tree into C sourcecode.
-    """
-    generator = SourceGenerator(constants=constants, fname=fname, lineno=lineno)
-    generator.visit(tree)
-#    c_code = "\n".join(generator.c_proc)
-    c_code = "".join(generator.c_proc)
-    return (c_code, generator.warnings)
-
+# TODO: should not allow eval of arbitrary python
 def isevaluable(s):
     try:
         eval(s)
@@ -133,42 +196,11 @@ def isevaluable(s):
     except Exception:
         return False
 
-class C_Vector():
-    def __init__(self):
-        self.size = 0
-        self.type = "double"
-        self.values = []
-        self.assign_line = -1
-        self.name = ""
-
-    def get_leading_space(self, indent_with="    ", indent_level = 1):
-        leading_space = ""
-        for n in range(indent_level):
-            leading_space += indent_with
-        return leading_space
-        
-    def item_declare_string(self, indent_with="    ", indent_level = 1):
-        declare_string = self.name + "[" + str(len(self.values)) + "]"
-        return declare_string
-    
-    def declare_string(self, indent_with="    ", indent_level = 1):
-        declare_string = self.get_leading_space(indent_with, indent_level)
-        declare_string += self.type + " " + item_declare_string(indent_with, indent_level)
-#        self.name + "[" + str(len(self.values)) + "];\n"
-        return declare_string
-    
-    def get_assign(self, indent_with="    ", indent_level = 1):
-        assign_loop = []
-        c_string = self.get_leading_space(indent_with, indent_level - 1)
-        c_string += "for (n=0 ; n < " + str(len(self.values)) + " ; n++) {"
-        assign_loop.append(c_string)
-        for n,value in enumerate(self.values):
-            c_string = self.get_leading_space(indent_with, indent_level)
-            c_string += self.name + "[" + str(n) + "] = " + str(value) + ";"
-            assign_loop.append(c_string)
-        c_string = self.get_leading_space(indent_with, indent_level - 1) + "}"
-        assign_loop.append(c_string)
-        return (assign_loop)
+def render_expression(tree):
+    generator = SourceGenerator()
+    generator.visit(tree)
+    c_code = "".join(generator.current_statement)
+    return c_code
 
 class SourceGenerator(NodeVisitor):
     """This visitor is able to transform a well formed syntax tree into python
@@ -176,13 +208,9 @@ class SourceGenerator(NodeVisitor):
     `node_to_source` function.
     """
 
-    def __init__(self, indent_with="    ", add_line_information=False,
-                 constants=None, fname=None, lineno=0):
-        self.result = []
+    def __init__(self, indent_with="    ", constants=None, fname=None, lineno=0):
         self.indent_with = indent_with
-        self.add_line_information = add_line_information
         self.indentation = 0
-        self.new_lines = 0
 
         # for C
         self.c_proc = []
@@ -192,7 +220,6 @@ class SourceGenerator(NodeVisitor):
         self.fname = fname
         self.lineno_offset = lineno
         self.warnings = []
-        self.statements = []
         self.current_statement = ""
         # TODO: use set rather than list for c_vars, ...
         self.c_vars = []
@@ -202,28 +229,19 @@ class SourceGenerator(NodeVisitor):
         self.c_functions = []
         self.c_vectors = []
         self.c_constants = constants if constants is not None else {}
+        self.in_expr = False
         self.in_subref = False
         self.in_subscript = False
         self.tuples = []
         self.required_functions = []
-        self.is_sequence = False
         self.visited_args = False
-        self.inside_if = False
-        self.C_Vectors = []
-        self.assign_target = ""
-        self.assign_c_vector = []
-
-    def write_python(self, x):
-        if self.new_lines:
-            if self.result:
-                self.result.append('\n' * self.new_lines)
-            self.result.append(self.indent_with * self.indentation)
-            self.new_lines = 0
-        self.result.append(x)
 
     def write_c(self, statement):
         # TODO: build up as a list rather than adding to string
         self.current_statement += statement
+
+    def write_python(self, x):
+        raise NotImplementedError("shouldn't be trying to write pythnon")
 
     def add_c_line(self, line):
         indentation = self.indent_with * self.indentation
@@ -247,39 +265,11 @@ class SourceGenerator(NodeVisitor):
         for arg in node.args:
             self.add_unique_var(arg.id)
 
-    def write_print(self, node):
-        self.write_c ("printf (")
-        c_str = self.current_statement
-        self.current_statement = ""
-        self.visit(node.args[0])
-        print_params = self.current_statement # save print agruments
-        self.current_statement = c_str
-        print_params = print_params[1:(len(print_params) - 1)] # remove parentheses
-        prcnt = print_params.rfind('%')
-        if prcnt >= 0:
-            format_string = print_params[0:prcnt-1].strip()
-            format_string = format_string[1:len(format_string) - 1]
-            var_string = print_params[prcnt+1:len(print_params)].strip()
-        else:
-            format_string = print_params
-            var_string = ""
-        format_string= format_string[:len(format_string)]
-        self.write_c('"' + format_string + '\\n"')
-        if (len(var_string) > 0):
-            self.write_c(', ' + var_string)
-        self.write_c(");")
-        self.add_current_line()
-
-
-
-    def newline(self, node=None, extra=0):
-        self.new_lines = max(self.new_lines, 1 + extra)
-        if node is not None and self.add_line_information:
-            self.write_c('# line: %s' % node.lineno)
-            self.new_lines = 1
-        if self.current_statement:
-            self.statements.append(self.current_statement)
-            self.current_statement = ''
+    def track_lineno(self, node):
+        #print("newline", node, [s for s in dir(node) if not s.startswith('_')])
+        if hasattr(node, 'lineno'):
+            line = '#line %d "%s"\n' % (node.lineno+self.lineno_offset-1, self.fname)
+            self.c_proc.append(line)
 
     def body(self, statements):
         if self.current_statement:
@@ -296,7 +286,9 @@ class SourceGenerator(NodeVisitor):
     def body_or_else(self, node):
         self.body(node.body)
         if node.orelse:
-            self.newline()
+            self.unsupported(node, "for...else/while...else not supported")
+
+            self.track_lineno(node)
             self.write_c('else:')
             self.body(node.orelse)
 
@@ -325,20 +317,24 @@ class SourceGenerator(NodeVisitor):
                     arg_name = arg.arg
                 except AttributeError:
                     arg_name = arg.id
-                w_str = ("Default Parameters are unknown to C: '%s = %s" \
-                        % (arg_name, str(default.n)))
+                w_str = ("C does not support default parameters: %s=%s"
+                         % (arg_name, str(default.n)))
                 self.warnings.append(w_str)
 
     def decorators(self, node):
+        if node.decorator_list:
+            self.unsupported(node.decorator_list[0])
         for decorator in node.decorator_list:
-            self.newline(decorator)
+            self.trac_lineno(decorator)
             self.write_python('@')
             self.visit(decorator)
 
     # Statements
 
     def visit_Assert(self, node):
-        self.newline(node)
+        self.unsupported(node)
+
+        self.track_lineno(node)
         self.write_c('assert ')
         self.visit(node.test)
         if node.msg is not None:
@@ -365,67 +361,62 @@ class SourceGenerator(NodeVisitor):
                     self.c_vars.append(target.id)
 
     def add_semi_colon(self):
-        semi_pos = self.current_statement.find(';')
-        if semi_pos > 0.0:
-            self.current_statement = self.current_statement.replace(';', '')
+        #semi_pos = self.current_statement.find(';')
+        #if semi_pos >= 0:
+        #    self.current_statement = self.current_statement.replace(';', '')
         self.write_c(';')
 
     def visit_Assign(self, node):
         self.add_current_line()
+        self.track_lineno(node)
+        self.in_expr = True
         for idx, target in enumerate(node.targets): # multi assign, as in 'a = b = c = 7'
             if idx:
                 self.write_c(' = ')
             self.define_c_vars(target)
             self.visit(target)
-            if hasattr(target,'id'):
-                self.assign_target = target.id
         # Capture assigned tuple names, if any
         targets = self.tuples[:]
         del self.tuples[:]
         self.write_c(' = ')
-        self.is_sequence = False
         self.visited_args = False
         self.visit(node.value)
-        if len(self.assign_c_vector):
-            for c_statement in self.assign_c_vector:
-                self.add_c_line (c_statement)
-#                self.c_proc.append(c_statement)
-            self.assign_c_vector.clear()
-        else:
-            self.add_semi_colon()
-            self.add_current_line()
+        self.add_semi_colon()
+        self.add_current_line()
         # Assign tuples to tuples, if any
         # TODO: doesn't handle swap:  a,b = b,a
-            for target, item in zip(targets, self.tuples):
-                self.visit(target)
-                self.write_c(' = ')
-                self.visit(item)
-                self.add_semi_colon()
-                self.add_current_line()
-            if self.is_sequence and not self.visited_args:
-                for target in node.targets:
-                    if hasattr(target, 'id'):
-                        if target.id in self.c_vars and target.id not in self.c_dcl_pointers:
-                            if target.id not in self.c_dcl_pointers:
-                                self.c_dcl_pointers.append(target.id)
-                                if target.id in self.c_vars:
-                                    self.c_vars.remove(target.id)
+        for target, item in zip(targets, self.tuples):
+            self.visit(target)
+            self.write_c(' = ')
+            self.visit(item)
+            self.add_semi_colon()
+            self.add_current_line()
+        #if self.is_sequence and not self.visited_args:
+        #    for target in node.targets:
+        #        if hasattr(target, 'id'):
+        #            if target.id in self.c_vars and target.id not in self.c_dcl_pointers:
+        #                if target.id not in self.c_dcl_pointers:
+        #                    self.c_dcl_pointers.append(target.id)
+        #                    if target.id in self.c_vars:
+        #                        self.c_vars.remove(target.id)
         self.current_statement = ''
-        self.assign_target = ''
+        self.in_expr = False
 
     def visit_AugAssign(self, node):
         if node.target.id not in self.c_vars:
             if node.target.id not in self.arguments:
                 self.c_vars.append(node.target.id)
+        self.in_expr = True
         self.visit(node.target)
         self.write_c(' ' + BINOP_SYMBOLS[type(node.op)] + '= ')
         self.visit(node.value)
         self.add_semi_colon()
+        self.in_expr = False
         self.add_current_line()
 
     def visit_ImportFrom(self, node):
         return  # import ignored
-        self.newline(node)
+        self.track_lineno(node)
         self.write_python('from %s%s import ' %('.' * node.level, node.module))
         for idx, item in enumerate(node.names):
             if idx:
@@ -434,14 +425,16 @@ class SourceGenerator(NodeVisitor):
 
     def visit_Import(self, node):
         return  # import ignored
-        self.newline(node)
+        self.track_lineno(node)
         for item in node.names:
             self.write_python('import ')
             self.visit(item)
 
     def visit_Expr(self, node):
-        self.newline(node)
+        #self.in_expr = True
+        #self.track_lineno(node)
         self.generic_visit(node)
+        #self.in_expr = False
 
     def write_c_pointers(self, start_var):
         if self.c_dcl_pointers:
@@ -467,17 +460,6 @@ class SourceGenerator(NodeVisitor):
             decls = ", ".join(self.c_int_vars)
             self.c_proc.insert(start_var, "    int " + decls + ";\n")
             have_decls = True
-            start_var += 1
-        if len(self.C_Vectors) > 0:
-            vec_declare = []
-            for c_vec in self.C_Vectors:
-                item_declare = c_vec.item_declare_string()
-                if item_declare not in vec_declare:
-                    vec_declare.append (item_declare)
-                if c_vec.name in self.c_vars:
-                    self.c_vars.remove(c_vec.name)
-            all_declare = "    double " + ", ".join (vec_declare) + ";\n"
-            self.c_proc.insert(start_var, all_declare)
             start_var += 1
 
         if self.c_vars:
@@ -518,10 +500,13 @@ class SourceGenerator(NodeVisitor):
             self.unsupported(node, "function within a function")
         self.current_function = node.name
 
+        # remember the location of the next warning that will be inserted
+        # so that we can stuff the function name ahead of the warning list
+        # if any warnings are generated by the function.
         warning_index = len(self.warnings)
-        self.newline(extra=1)
+
         self.decorators(node)
-        self.newline(node)
+        self.track_lineno(node)
         self.arguments = []
         self.visit(node.args)
         # for C
@@ -532,16 +517,14 @@ class SourceGenerator(NodeVisitor):
         self.add_c_line("}\n")
         self.insert_signature()
         self.insert_c_vars(start_vars)
-#        self.c_pointers = []
-        self.c_pointers.clear()
-        self.C_Vectors.clear()
+        del self.c_pointers[:]
         self.current_function = ""
-        if (warning_index != len(self.warnings)):
+        if warning_index != len(self.warnings):
             self.warnings.insert(warning_index, "Warning in function '" + node.name + "':")
-            self.warnings.append("Note: C compilation will fail")
-
 
     def visit_ClassDef(self, node):
+        self.unsupported(node)
+
         have_args = []
         def paren_or_comma():
             if have_args:
@@ -550,9 +533,8 @@ class SourceGenerator(NodeVisitor):
                 have_args.append(True)
                 self.write_python('(')
 
-        self.newline(extra=2)
         self.decorators(node)
-        self.newline(node)
+        self.track_lineno(node)
         self.write_python('class %s' % node.name)
         for base in node.bases:
             paren_or_comma()
@@ -575,10 +557,12 @@ class SourceGenerator(NodeVisitor):
         self.body(node.body)
 
     def visit_If(self, node):
-        self.add_current_line()
-        self.inside_if = True
+
+        self.track_lineno(node)
         self.write_c('if ')
+        self.in_expr = True
         self.visit(node.test)
+        self.in_expr = False
         self.write_c(' {')
         self.body(node.body)
         self.add_c_line('}')
@@ -589,21 +573,22 @@ class SourceGenerator(NodeVisitor):
             #elif hasattr(else_, 'orelse'):
             elif len(else_) == 1 and isinstance(else_[0], ast.If):
                 node = else_[0]
-                #self.newline()
+                self.track_lineno(node)
                 self.write_c('else if ')
+                self.in_expr = True
                 self.visit(node.test)
+                self.in_expr = False
                 self.write_c(' {')
                 self.body(node.body)
                 self.add_current_line()
                 self.add_c_line('}')
                 #break
             else:
-                self.newline()
+                self.track_lineno(else_)
                 self.write_c('else {')
-                self.body(node.orelse)
+                self.body(else_)
                 self.add_c_line('}')
                 break
-        self.inside_if = False
 
     def get_for_range(self, node):
         stop = ""
@@ -630,9 +615,9 @@ class SourceGenerator(NodeVisitor):
             raise("Ilegal for loop parameters")
         return start, stop, step
 
-    def add_c_int_var (self, iterator):
-        if iterator not in self.c_int_vars:
-            self.c_int_vars.append(iterator)
+    def add_c_int_var(self, name):
+        if name not in self.c_int_vars:
+            self.c_int_vars.append(name)
 
     def visit_For(self, node):
         # node: for iterator is stored in node.target.
@@ -646,9 +631,9 @@ class SourceGenerator(NodeVisitor):
                     self.visit(node.target)
                     iterator = self.current_statement
                     self.current_statement = ''
-                    self.add_c_int_var (iterator)
+                    self.add_c_int_var(iterator)
                     start, stop, step = self.get_for_range(node)
-                    self.write_c("for(" + iterator + "=" + str(start) +
+                    self.write_c("for (" + iterator + "=" + str(start) +
                                  " ; " + iterator + " < " + str(stop) +
                                  " ; " + iterator + " += " + str(step) + ") {")
                     self.body_or_else(node)
@@ -663,20 +648,21 @@ class SourceGenerator(NodeVisitor):
             self.visit(node.iter)
             self.write_c(':')
             # report the error
-            self.unsupported("unsupported " + self.current_statement)
+            self.unsupported(node, "unsupported " + self.current_statement)
 
     def visit_While(self, node):
-        self.newline(node)
+        self.track_lineno(node)
         self.write_c('while ')
         self.visit(node.test)
-        self.write_c(' { ')
+        self.write_c(' {')
         self.body_or_else(node)
         self.write_c('}')
         self.add_current_line()
 
     def visit_With(self, node):
         self.unsupported(node)
-        self.newline(node)
+
+        self.track_lineno(node)
         self.write_python('with ')
         self.visit(node.context_expr)
         if node.optional_vars is not None:
@@ -686,14 +672,15 @@ class SourceGenerator(NodeVisitor):
         self.body(node.body)
 
     def visit_Pass(self, node):
-        self.newline(node)
+        #self.track_lineno(node)
         #self.write_python('pass')
+        pass
 
     def visit_Print(self, node):
-        # TODO: print support would be nice, though hard to do
         self.unsupported(node)
+
         # CRUFT: python 2.6 only
-        self.newline(node)
+        self.track_lineno(node)
         self.write_c('print ')
         want_comma = False
         if node.dest is not None:
@@ -710,7 +697,8 @@ class SourceGenerator(NodeVisitor):
 
     def visit_Delete(self, node):
         self.unsupported(node)
-        self.newline(node)
+
+        self.track_lineno(node)
         self.write_python('del ')
         for idx, target in enumerate(node):
             if idx:
@@ -719,7 +707,8 @@ class SourceGenerator(NodeVisitor):
 
     def visit_TryExcept(self, node):
         self.unsupported(node)
-        self.newline(node)
+
+        self.track_linno(node)
         self.write_python('try:')
         self.body(node.body)
         for handler in node.handlers:
@@ -727,46 +716,51 @@ class SourceGenerator(NodeVisitor):
 
     def visit_TryFinally(self, node):
         self.unsupported(node)
-        self.newline(node)
+
+        self.track_lineno(node)
         self.write_python('try:')
         self.body(node.body)
-        self.newline(node)
+        self.track_lineno(node)
         self.write_python('finally:')
         self.body(node.finalbody)
 
     def visit_Global(self, node):
         self.unsupported(node)
-        self.newline(node)
+
+        self.track_lineno(node)
         self.write_python('global ' + ', '.join(node.names))
 
     def visit_Nonlocal(self, node):
-        self.newline(node)
+        self.track_lineno(node)
         self.write_python('nonlocal ' + ', '.join(node.names))
 
     def visit_Return(self, node):
         self.add_current_line()
+        self.track_lineno(node)
+        self.in_expr = True
         if node.value is None:
             self.write_c('return')
         else:
-            self.write_c('return(')
+            self.write_c('return ')
             self.visit(node.value)
-        self.write_c(')')
         self.add_semi_colon()
+        self.in_expr = False
         self.add_c_line(self.current_statement)
         self.current_statement = ''
 
     def visit_Break(self, node):
-        self.newline(node)
+        self.track_lineno(node)
         self.write_c('break')
 
     def visit_Continue(self, node):
-        self.newline(node)
+        self.track_lineno(node)
         self.write_c('continue')
 
     def visit_Raise(self, node):
         self.unsupported(node)
+
         # CRUFT: Python 2.6 / 3.0 compatibility
-        self.newline(node)
+        self.track_lineno(node)
         self.write_python('raise')
         if hasattr(node, 'exc') and node.exc is not None:
             self.write_python(' ')
@@ -787,6 +781,7 @@ class SourceGenerator(NodeVisitor):
 
     def visit_Attribute(self, node):
         self.unsupported(node, "attribute reference a.b not supported")
+
         self.visit(node.value)
         self.write_python('.' + node.attr)
 
@@ -806,9 +801,6 @@ class SourceGenerator(NodeVisitor):
                 self.write_c('(int) ')
             elif node.func.id == "SINCOS":
                 self.write_sincos(node)
-                return
-            elif node.func.id == "print":
-                self.write_print(node)
                 return
             else:
                 self.visit(node.func)
@@ -834,10 +826,25 @@ class SourceGenerator(NodeVisitor):
                 self.write_c('**')
                 self.visit(node.kwargs)
         self.write_c(')')
-        if (self.inside_if == False):
-            self.write_c(';')
+        if not self.in_expr:
+            self.add_semi_colon()
+
+    TRANSLATE_CONSTANTS = {
+        # python 2 uses normal name references through vist_Name
+        'True': 'true',
+        'False': 'false',
+        'None': 'NULL',  # "None" will probably fail for other reasons
+        # python 3 uses NameConstant
+        True: 'true',
+        False: 'false',
+        None: 'NULL',  # "None" will probably fail for other reasons
+        }
 
     def visit_Name(self, node):
+        translation = self.TRANSLATE_CONSTANTS.get(node.id, None)
+        if translation:
+            self.write_c(translation)
+            return
         self.write_c(node.id)
         if node.id in self.c_pointers and not self.in_subref:
             self.write_c("[0]")
@@ -852,15 +859,30 @@ class SourceGenerator(NodeVisitor):
                 name not in self.c_int_vars and name not in self.arguments and
                 name not in self.c_constants and not name.isdigit()):
             if self.in_subscript:
-                self.add_c_int_var (self, node.id)
+                self.add_c_int_var(node.id)
             else:
                 self.c_vars.append(node.id)
 
+    def visit_NameConstant(self, node):
+        translation = self.TRANSLATE_CONSTANTS.get(node.value, None)
+        if translation is not None:
+            self.write_c(translation)
+        else:
+            self.unsupported(node, "don't know how to translate %r"%node.value)
+
     def visit_Str(self, node):
-        self.write_c(repr(node.s))
+        s = node.s
+        s = s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        self.write_c('"')
+        self.write_c(s)
+        self.write_c('"')
 
     def visit_Bytes(self, node):
-        self.write_c(repr(node.s))
+        s = node.s
+        s = s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+        self.write_c('"')
+        self.write_c(s)
+        self.write_c('"')
 
     def visit_Num(self, node):
         self.write_c(repr(node.n))
@@ -872,47 +894,23 @@ class SourceGenerator(NodeVisitor):
             else:
                 self.visit(item)
 
-    def sequence_visit(left, right):
-        def visit(self, node):
-            self.is_sequence = True
-            c_vec = C_Vector()
-            s = ""
-            for idx, item in enumerate(node.elts):
-                if idx > 0 and s:
-                    s += ', '
-                if hasattr(item, 'id'):
-                    c_vec.values.append(item.id)
-#                    s += item.id
-                elif hasattr(item, 'n'):
-                    c_vec.values.append(item.n)
-#                    s += str(item.n)
-                else:
-                    temp = self.current_statement
-                    self.current_statement = ""
-                    self.visit(item)
-                    c_vec.values.append(self.current_statement)
-#                    s += self.current_statement
-                    self.current_statement = temp
-            if (self.assign_target):
-                self.add_c_int_var ('n')
-                c_vec.name = self.assign_target
-                self.C_Vectors.append(c_vec)
-                assign_strings = c_vec.get_assign()
-                for assign_str in assign_strings:
-                    self.assign_c_vector.append(assign_str)
-#                    self.add_c_line(assign_str)
-#            if s:
-#                self.c_vectors.append(s)
-#                vec_name = "vec"  + str(len(self.c_vectors))
-#                self.write_c(vec_name)
-        return visit
+    def visit_List(self, node):
+        #self.unsupported(node)
+        #print("visiting", node)
+        #print(astor.to_source(node))
+        #print(node.elts)
+        exprs = [render_expression(item) for item in node.elts]
+        if exprs:
+            self.c_vectors.append(', '.join(exprs))
+            vec_name = "vec"  + str(len(self.c_vectors))
+            self.write_c(vec_name)
 
-    visit_List = sequence_visit('[', ']')
-    visit_Set = sequence_visit('{', '}')
-    del sequence_visit
+    def visit_Set(self, node):
+        self.unsupported(node)
 
     def visit_Dict(self, node):
         self.unsupported(node)
+
         self.write_python('{')
         for idx, (key, value) in enumerate(zip(node.keys, node.values)):
             if idx:
@@ -963,14 +961,21 @@ class SourceGenerator(NodeVisitor):
         self.write_c(")")
         if is_negative_exp:
             self.write_c(")")
-        self.write_c(" ")
+        #self.write_c(" ")
 
     def translate_integer_divide(self, node):
-        self.write_c("(int)(")
+        self.write_c("(int)((")
         self.visit(node.left)
-        self.write_c(") /(int)(")
+        self.write_c(")/(")
         self.visit(node.right)
-        self.write_c(")")
+        self.write_c("))")
+
+    def translate_float_divide(self, node):
+        self.write_c("((double)(")
+        self.visit(node.left)
+        self.write_c(")/(double)(")
+        self.visit(node.right)
+        self.write_c("))")
 
     def visit_BinOp(self, node):
         self.write_c("(")
@@ -978,6 +983,8 @@ class SourceGenerator(NodeVisitor):
             self.translate_power(node)
         elif '%s' % BINOP_SYMBOLS[type(node.op)] == BINOP_SYMBOLS[ast.FloorDiv]:
             self.translate_integer_divide(node)
+        elif '%s' % BINOP_SYMBOLS[type(node.op)] == BINOP_SYMBOLS[ast.Div]:
+            self.translate_float_divide(node)
         else:
             self.visit(node.left)
             self.write_c(' %s ' % BINOP_SYMBOLS[type(node.op)])
@@ -1042,11 +1049,13 @@ class SourceGenerator(NodeVisitor):
 
     def visit_Yield(self, node):
         self.unsupported(node)
+
         self.write_python('yield ')
         self.visit(node.value)
 
     def visit_Lambda(self, node):
         self.unsupported(node)
+
         self.write_python('lambda ')
         self.visit(node.args)
         self.write_python(': ')
@@ -1054,6 +1063,7 @@ class SourceGenerator(NodeVisitor):
 
     def visit_Ellipsis(self, node):
         self.unsupported(node)
+
         self.write_python('Ellipsis')
 
     def generator_visit(left, right):
@@ -1074,6 +1084,7 @@ class SourceGenerator(NodeVisitor):
 
     def visit_DictComp(self, node):
         self.unsupported(node)
+
         self.write_python('{')
         self.visit(node.key)
         self.write_python(': ')
@@ -1082,25 +1093,14 @@ class SourceGenerator(NodeVisitor):
             self.visit(comprehension)
         self.write_python('}')
 
-    def visit_NameConstant (self, node):
-        if (hasattr (node, "value")):
-            if (node.value == True):
-                val = "1"
-            elif node.value == False:
-                val = "0"
-            else:
-                val = ""
-            if (len(val) > 0):
-                self.write_c("(" + val + ")")
-
     def visit_IfExp(self, node):
-        self.write_c('(')
+        self.write_c('((')
         self.visit(node.test)
-        self.write_c(' ? ')
+        self.write_c(')?(')
         self.visit(node.body)
-        self.write_c(' : ')
+        self.write_c('):(')
         self.visit(node.orelse)
-        self.write_c(');')
+        self.write_c('))')
 
     def visit_Starred(self, node):
         self.write_c('*')
@@ -1116,14 +1116,17 @@ class SourceGenerator(NodeVisitor):
 
     def visit_alias(self, node):
         self.unsupported(node)
+
         self.write_python(node.name)
         if node.asname is not None:
             self.write_python(' as ' + node.asname)
 
     def visit_comprehension(self, node):
+        self.unsupported(node)
+
         self.write_c(' for ')
         self.visit(node.target)
-        self.write_C(' in ')
+        self.write_c(' in ')
         #self.write_python(' in ')
         self.visit(node.iter)
         if node.ifs:
@@ -1178,9 +1181,9 @@ def define_constant(name, value, block_size=1):
     """
     const = "constant "  # OpenCL needs globals to be constant
     if isinstance(value, int):
-        parts = [const + "int ", name, " = ", "%d"%value, ";"]
+        parts = [const + "int ", name, " = ", "%d"%value, ";\n"]
     elif isinstance(value, float):
-        parts = [const + "double ", name, " = ", "%.15g"%value, ";"]
+        parts = [const + "double ", name, " = ", "%.15g"%value, ";\n"]
     else:
         try:
             len(value)
@@ -1194,7 +1197,7 @@ def define_constant(name, value, block_size=1):
             value = list(value) + [0.]*(block_size - len(value)%block_size)
         elements = ["%.15g"%v for v in value]
         parts = [const + "double ", name, "[]", " = ",
-                 "{\n   ", ", ".join(elements), "\n};"]
+                 "{\n   ", ", ".join(elements), "\n};\n"]
 
     return "".join(parts)
 
@@ -1238,46 +1241,48 @@ def ordered_dag(dag):
         raise ValueError("Cyclic dependes exists amongst these items:\n%s"
                          % ", ".join(str(node) for node in dag.keys()))
 
+import re
+PRINT_ARGS = re.compile(r'print[(]"(?P<template>[^"]*)" *% *[(](?P<args>[^\n]*)[)] *[)] *\n')
+SUBST_ARGS = r'printf("\g<template>\\n", \g<args>)\n'
+PRINT_STR = re.compile(r'print[(]"(?P<template>[^"]*)" *[)] *\n')
+SUBST_STR = r'printf("\g<template>\n")'
 def translate(functions, constants=None):
-    # type: (List[(str, str, int)], Dict[str, any]) -> List[str]
+    # type: (Sequence[(str, str, int)], Dict[str, any]) -> List[str]
     """
-    Convert a set of functions
+    Convert a list of functions to a list of C code strings.
+
+    Returns list of corresponding code snippets (with trailing lines in
+    each block) and a list of warnings generated by the translator.
+
+    A function is given by the tuple (source, filename, line number).
+
+    Global constants are given in a dictionary of {name: value}.  The
+    constants are used for name space resolution and type inferencing.
+    Constants are not translated by this code. Instead, call
+    :func:`define_constant` with name and value, and maybe block_size
+    if arrays need to be padded to the next block boundary.
+
+    Function prototypes are not generated. Use :func:`ordered_dag`
+    to list the functions in reverse order of dependency before calling
+    translate. [Maybe a future revision will return the function prototypes
+    so that a suitable "*.h" file can be generated.
     """
     snippets = []
-    snippets.append("#include <math.h>")
-    snippets.append("")
     warnings = []
     for source, fname, lineno in functions:
-        line_directive = '#line %d "%s"'%(lineno, fname.replace('\\', '\\\\'))
+        line_directive = '#line %d "%s"\n'%(lineno, fname.replace('\\', '\\\\'))
         snippets.append(line_directive)
+        # Replace simple print function calls with printf statements
+        source = PRINT_ARGS.sub(SUBST_ARGS, source)
+        source = PRINT_STR.sub(SUBST_STR, source)
         tree = ast.parse(source)
-        c_code,w = to_source(tree, constants=constants, fname=fname, lineno=lineno)
-        if w:
-            warnings.append ("\n".join(w))
+        generator = SourceGenerator(constants=constants, fname=fname, lineno=lineno)
+        generator.visit(tree)
+        c_code = "".join(generator.c_proc)
         snippets.append(c_code)
-    return "\n".join(snippets),warnings
-#    return snippets
+        warnings.extend(generator.warnings)
+    return snippets, warnings
 
-def print_usage ():
-        print("""\
-            Usage: python py2c.py <infile> [<outfile>]
-            if outfile is omitted, output file is '<infile>.c'
-        """)
-
-def get_files_names ():
-    import os
-    fname_in = fname_out = ""
-    valid_params =  len(sys.argv) > 1
-    if (valid_params == False):
-        print_usage()
-    else:
-        fname_in = sys.argv[1]
-        if len(sys.argv) == 2:
-            fname_base = os.path.splitext(fname_in)[0]
-            fname_out = str(fname_base) + '.c'
-        else:
-            fname_out = sys.argv[2]
-    return valid_params, fname_in,fname_out
 
 C_HEADER = """
 #include <stdio.h>
@@ -1298,15 +1303,29 @@ double polyval(constant double *coef, double x, int N)
     return ans;
 }
 """
+
+USAGE = """\
+Usage: python py2c.py <infile> [<outfile>]
+
+if outfile is omitted, output file is '<infile>.c'
+"""
+
 def main():
-    print("Parsing...using Python" + sys.version)
-    valid_params, fname_in, fname_out = get_files_names ()
-    if (valid_params == False):
-        print("Input parameters error.\nExiting")
+    import os
+    #print("Parsing...using Python" + sys.version)
+    if len(sys.argv) == 1:
+        print(USAGE)
         return
 
+    fname_in = sys.argv[1]
+    if len(sys.argv) == 2:
+        fname_base = os.path.splitext(fname_in)[0]
+        fname_out = str(fname_base) + '.c'
+    else:
+        fname_out = sys.argv[2]
+
     with open(fname_in, "r") as python_file:
-            code = python_file.read()
+        code = python_file.read()
     name = "gauss"
     code = (code
             .replace(name+'.n', 'GAUSS_N')
@@ -1314,18 +1333,18 @@ def main():
             .replace(name+'.w', 'GAUSS_W')
             .replace('if __name__ == "__main__"', "def main()")
            )
-    translation,warnings = translate([(code, fname_in, 1)])
-    translation = translation.replace("double main()", "int main(int argc, char *argv[])")
+
+    translation, warnings = translate([(code, fname_in, 1)])
+    c_code = "".join(translation)
+    c_code = c_code.replace("double main()", "int main(int argc, char *argv[])")
 
     with open(fname_out, "w") as file_out:
         file_out.write(C_HEADER)
-        file_out.write(str(translation))
+        file_out.write(c_code)
+
     if warnings:
-        print("".join(str(warnings[0])))
-    print("...Done")
+        print("\n".join(warnings))
+    #print("...Done")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as excp:
-        print ("Error:\n" + str(excp.args))
+    main()
